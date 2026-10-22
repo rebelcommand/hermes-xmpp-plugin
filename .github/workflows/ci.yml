@@ -16,6 +16,7 @@ jobs:
         run: |
           python3 -m venv .venv-ci
           .venv-ci/bin/pip install --quiet pytest ruff pyyaml
+          .venv-ci/bin/pip install --quiet -r requirements.txt
 
       - name: Lint with ruff
         run: .venv-ci/bin/ruff check .

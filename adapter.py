@@ -35,7 +35,64 @@ from slixmpp.plugins.base import register_plugin
 from slixmpp.stanza import Message
 from tools.transcription_tools import transcribe_audio
 
+
+class _AesgcmRedactingFilter(logging.Filter):
+    """Defensive filter: redact aesgcm:// fragments from any log record.
+
+    Covers both the formatted message AND exception tracebacks (exc_info),
+    pre-formatted exception text (exc_text) and stack_info. Each field is
+    only processed when it may contain 'aesgcm' (case-insensitive) to keep
+    cost ~0 for ordinary messages. Installed on the module logger so an
+    unpatched call site can never leak an AES-GCM key fragment into the logs.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            # 1. Redact the formatted message. Args are consumed by the
+            # already-formatted msg so a second pass (idempotence) yields
+            # the same string.
+            msg = record.getMessage()
+            if "aesgcm" in msg.lower():
+                record.msg = _redact_aesgcm_in_text(msg)
+                record.args = ()
+
+            # 2. Redact exception tracebacks. logger.exception(...)/exc_info=
+            # attach the raw exception whose text may carry an
+            # aesgcm://...#KEY URL. Format eagerly, redact, cache in
+            # exc_text and clear exc_info: standard Formatters reuse
+            # exc_text when present, so the visible stack is preserved.
+            # Never store a string in exc_info — that field expects an
+            # (type, value, traceback) tuple or None.
+            if record.exc_info:
+                exc_text = logging.Formatter().formatException(record.exc_info)
+                if "aesgcm" in exc_text.lower():
+                    exc_text = _redact_aesgcm_in_text(exc_text)
+                record.exc_text = exc_text
+                record.exc_info = None
+
+            # 3. Redact pre-formatted exception text (e.g. pre-filled by an
+            # upstream formatter or a previous pass — keeps idempotence).
+            if record.exc_text and "aesgcm" in record.exc_text.lower():
+                record.exc_text = _redact_aesgcm_in_text(record.exc_text)
+
+            # 4. Redact stack_info dumps the same way.
+            if record.stack_info and "aesgcm" in record.stack_info.lower():
+                record.stack_info = _redact_aesgcm_in_text(record.stack_info)
+        except Exception:
+            # Fail-closed: drop the record rather than risk leaking the
+            # original (potentially keyed) payload.
+            return False
+        return True
+
+
 logger = logging.getLogger(__name__)
+# Install at most once: logging.getLogger() returns the same singleton across
+# module reloads, so a naive addFilter() would stack duplicate filters. The
+# dedup check compares the class NAME instead of isinstance(): a reload
+# rebinds _AesgcmRedactingFilter to a fresh class object that isinstance()
+# no longer recognizes, whereas the name is reload-stable.
+if not any(type(_existing_filter).__name__ == "_AesgcmRedactingFilter" for _existing_filter in logger.filters):
+    logger.addFilter(_AesgcmRedactingFilter())
 
 # XMPP servers and clients choke on very large stanzas, so send() splits every
 # reply into wire-sized chunks (see _send_text below). MAX_MESSAGE_LENGTH is
@@ -218,23 +275,76 @@ def _is_media_url(url: str) -> bool:
     ))
 
 
-def _log_safe_url(url: str) -> str:
-    """Return a URL safe to write to logs.
+def _redact_aesgcm_url(url: str) -> str:
+    """Redact the fragment of an ``aesgcm://`` URL, fail-closed.
 
-    An ``aesgcm://`` URL carries its AES-256-GCM key in the URL fragment
-    (XEP-0454), and that key is the only secret protecting the uploaded
-    ciphertext. Never log it: the fragment is replaced with a marker. All
-    other URLs are returned unchanged.
+    Never returns the original string if it contains a fragment after an
+    ``aesgcm://`` scheme, except for an already-redacted ``<redacted>``
+    fragment (idempotence). Works on malformed URLs (no urlparse).
     """
     if not url:
         return url
     try:
-        parsed = urlparse(url)
+        # Find first aesgcm:// occurrence (case-insensitive, anywhere).
+        match = re.search(r"aesgcm://", url, re.IGNORECASE)
+        if not match:
+            return url
+        # Find first # after the scheme.
+        hash_pos = url.find("#", match.end())
+        if hash_pos == -1:
+            return url
+        # Short-circuit an already-redacted fragment so applying the
+        # redaction twice yields the same string (idempotence).
+        if url[hash_pos + 1:] == "<redacted>":
+            return url
+        # Redact from # to end of string.
+        return url[:hash_pos] + "#<redacted>"
     except Exception:
-        return url
-    if parsed.scheme == "aesgcm" and parsed.fragment:
-        return parsed._replace(fragment="<redacted>").geturl()
-    return url
+        # Fail-closed: if anything goes wrong, mask aggressively.
+        return "<redacted>"
+
+
+def _log_safe_url(url: str) -> str:
+    """Return a URL safe to write to logs.
+
+    An ``aesgcm://`` URL carries its AES-256-GCM key in the URL fragment
+    (XEP-0454). The fragment is always redacted, even for malformed URLs.
+    All other URLs are returned unchanged.
+    """
+    return _redact_aesgcm_url(url)
+
+
+# ``aesgcm://`` URLs can be embedded inline in message bodies or display
+# texts; capture each URL up to the next whitespace or double quote. The
+# apostrophe is deliberately NOT excluded: it is a legal character inside
+# URL paths (e.g. ``alice's-photo.png``), and stopping there would leave
+# the fragment — and its key — unredacted. A URL wrapped in single quotes
+# therefore swallows its closing ``'`` into the masked fragment
+# fail-closed, which is acceptable (the key is what must not survive).
+# Angle brackets are also NOT excluded so an already-redacted fragment
+# (``#<redacted>``) is consumed as a single match, keeping the redaction
+# idempotent; any extra trailing characters are swallowed fail-closed.
+# ``*`` (not ``+``) also catches a bare ``aesgcm://`` or ``aesgcm://#KEY``,
+# and ``re.IGNORECASE`` covers odd-cased schemes like ``AESGCM://``.
+_AESGCM_URL_RE = re.compile(r"aesgcm://[^\s\"]*", re.IGNORECASE)
+
+
+def _redact_aesgcm_in_text(text: str) -> str:
+    """Redact AES-GCM key fragments from every ``aesgcm://`` URL in text.
+
+    Known edge case: a malformed URL with whitespace before its fragment
+    (``aesgcm://host/file #KEY``) stops the textual match at the space, so
+    such fragments are NOT covered by this redaction (the defensive log
+    filter may still scrub simple cases).
+    """
+    if not text:
+        return text
+    return _AESGCM_URL_RE.sub(lambda m: _redact_aesgcm_url(m.group(0)), text)
+
+
+def _truncate_safe(text: str, limit: int) -> str:
+    """Redact aesgcm keys then truncate — redaction MUST happen before slicing."""
+    return _redact_aesgcm_in_text(text)[:limit]
 
 
 def _is_blocked_ssrf_url(url: str) -> bool:
@@ -785,7 +895,7 @@ class XMPPAdapter(BasePlatformAdapter):
     ) -> SendResult:
         # reply_to is accepted for base-class compatibility but unused: XMPP has
         # no reply-threading primitive wired into this adapter's delivery path.
-        logger.debug("XMPP: send() called chat_id=%s content=%r", chat_id, content[:80])
+        logger.debug("XMPP: send() called chat_id=%s content=%r", chat_id, _truncate_safe(content, 80))
         if self.client is None:
             logger.error("XMPP: cannot send, client not connected")
             return SendResult(success=False, error="not connected")
@@ -1452,7 +1562,11 @@ class XMPPAdapter(BasePlatformAdapter):
             resp.raise_for_status()
             return resp.content
         except Exception as exc:
-            logger.warning("XMPP: failed to download %s: %s", _log_safe_url(url), exc)
+            logger.warning(
+                "XMPP: failed to download %s: %s",
+                _log_safe_url(url),
+                _redact_aesgcm_in_text(str(exc)),
+            )
             return None
 
     async def _download_aesgcm(self, url: str) -> Optional[bytes]:
@@ -1478,7 +1592,13 @@ class XMPPAdapter(BasePlatformAdapter):
             plaintext = aesgcm.decrypt(iv, ciphertext, None)
             return plaintext
         except Exception as exc:
-            logger.warning("XMPP: failed to decrypt aesgcm %s: %s", _log_safe_url(url), exc)
+            # httpx and cryptography exceptions can embed the full aesgcm://
+            # URL (key included) in their message; redact before logging.
+            logger.warning(
+                "XMPP: failed to decrypt aesgcm %s: %s",
+                _log_safe_url(url),
+                _redact_aesgcm_in_text(str(exc)),
+            )
             return None
 
     def _extract_url(self, text: str) -> Optional[str]:
@@ -1486,10 +1606,40 @@ class XMPPAdapter(BasePlatformAdapter):
         # brackets/quotes that are not part of the URL. The period is kept in
         # the match because it is a legitimate URL character (domain names and
         # file extensions); only a trailing period is removed afterward.
-        match = re.search(r"https?://[^\s<>\"')\]}]+|aesgcm://[^\s<>\"')\]}]+", text)
+        # The aesgcm alternative deliberately allows apostrophes: they are
+        # legal URL-path characters (e.g. alice's-photo.png) and stopping
+        # there would strand the keyed fragment in the body, which the
+        # URL->media-path replacement in _on_message would then re-expose.
+        # A URL wrapped in single quotes therefore swallows its closing
+        # quote into the match; the enclosing-quote strip below removes it
+        # so the key fragment keeps its required 88-character length.
+        match = re.search(
+            r"https?://[^\s<>\"')\]}]+|aesgcm://[^\s<>\")\]}]+",
+            text,
+        )
         if not match:
             return None
         url = match.group(0)
+        # Strip the closing single quote of a URL enclosed in quotes (e.g.
+        # 'aesgcm://host/f#KEY' -> aesgcm://host/f#KEY) while keeping
+        # internal apostrophes (e.g. alice's-photo.png) untouched: the
+        # extra character would corrupt the key fragment (89 chars instead
+        # of 88) and make _download_aesgcm reject a decryptable URL. The
+        # regex always starts at the scheme, so only the trailing quote can
+        # end up inside the match; the URL is treated as enclosed when the
+        # character right before the match is a quote too. Trailing
+        # punctuation is stripped BEFORE the quote check because a quoted
+        # URL followed by sentence punctuation (e.g. 'aesgcm://host/f#KEY'.)
+        # hides the quote behind it; punctuation is re-stripped afterward in
+        # case more of it followed the quote inside the match.
+        url = url.rstrip(".,;:!?")
+        if (
+            len(url) >= 2
+            and url.endswith("'")
+            and match.start() > 0
+            and text[match.start() - 1] == "'"
+        ):
+            url = url[:-1]
         return url.rstrip(".,;:!?")
 
     # -- Avatar --------------------------------------------------------------
@@ -1761,7 +1911,10 @@ class XMPPAdapter(BasePlatformAdapter):
                 return
 
             body = msg.get("body", "").strip()
-            logger.debug("XMPP: _on_message body=%r has_encrypted check next", body)
+            logger.debug(
+                "XMPP: _on_message body=%r has_encrypted check next",
+                _redact_aesgcm_in_text(body),
+            )
             encrypted = False
 
             # Only attempt OMEMO decryption if the stanza actually contains an
@@ -1930,11 +2083,13 @@ class XMPPAdapter(BasePlatformAdapter):
                             msg_type = MessageType.PHOTO
                             media_path = self._cache_media(data, "image")
                     else:
-                        logger.warning("XMPP: failed to download media from %s", url)
+                        logger.warning("XMPP: failed to download media from %s", _log_safe_url(url))
                         msg_type = MessageType.TEXT
                 else:
                     # Plain hyperlink, not media; leave as text.
-                    logger.debug("XMPP: treating URL as text link: %s", url)
+                    # Fail-closed: even a "plain" hyperlink is passed through the
+                    # safe helper so no raw URL can ever reach the logs.
+                    logger.debug("XMPP: treating URL as text link: %s", _log_safe_url(url))
                     msg_type = MessageType.TEXT
 
                 # Remember that this was a voice message before we convert it to TEXT
@@ -1992,11 +2147,16 @@ class XMPPAdapter(BasePlatformAdapter):
                 thread_id=None,
             )
 
+            # Invariant: the agent only ever sees the redacted form.
+            # The local download used the original URL (kept in `url` variable).
             event = MessageEvent(
-                text=display_text,
+                text=_redact_aesgcm_in_text(display_text),
                 message_type=msg_type,
                 source=source,
-                raw_message=msg,
+                # Contrat vérifié : le core accepte None (gateway/platforms/event.py:55,
+                # raw_message: Any = None). Le stanza brut peut contenir des clés
+                # aesgcm:// ; ne pas le transmettre.
+                raw_message=None,
                 media_urls=media_urls,
                 media_types=media_types,
                 metadata={
@@ -2009,7 +2169,11 @@ class XMPPAdapter(BasePlatformAdapter):
                 },
             )
 
-            logger.debug("XMPP: about to handle_message event text=%r type=%s", display_text, msg_type)
+            logger.debug(
+                "XMPP: about to handle_message event text=%r type=%s",
+                _redact_aesgcm_in_text(display_text),
+                msg_type,
+            )
 
             # If the inbound message was a voice message, opt this DM chat into
             # the adapter-level voice reply queue so we reply with TTS audio plus
