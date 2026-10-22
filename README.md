@@ -184,7 +184,7 @@ Change the STT model or TTS provider by editing the corresponding blocks in `~/.
 
 The adapter publishes a bot avatar using XEP-0084 (User Avatar) and XEP-0153 (vCard-based Avatars). Most XMPP clients show this as the bot's profile picture.
 
-Provide a PNG or JPEG; the adapter crops to a centered square, resizes to 480x480, converts to PNG, and publishes through both PEP (XEP-0084) and vCard (XEP-0153) for maximum client compatibility. `post_install.py` prompts for it and stores it as `XMPP_AVATAR_PATH` in `.env` (or set it there yourself):
+Provide a PNG or JPEG; the adapter crops to a centered square, resizes to 256x256, converts to PNG, and publishes through both PEP (XEP-0084) and vCard (XEP-0153) for maximum client compatibility. Avatars whose base64 encoding exceeds 200 KiB are skipped entirely: publishing them would exceed the server's stanza size limit and close the stream. `post_install.py` prompts for it and stores it as `XMPP_AVATAR_PATH` in `.env` (or set it there yourself):
 
 ```bash
 # ~/.hermes/.env

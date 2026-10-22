@@ -1530,7 +1530,11 @@ class XMPPAdapter(BasePlatformAdapter):
             return False
 
     async def _publish_avatar(self) -> None:
-        if not self.avatar_path or self.client is None:
+        # Capture the client reference locally: self.client can be set to None by
+        # _cleanup_client() (reconnect path) while we are awaiting to_thread below.
+        # Without this, self.client.plugin.get() raises AttributeError 'NoneType'.
+        client = self.client
+        if not self.avatar_path or client is None:
             return
         try:
             path = Path(self.avatar_path)
@@ -1542,6 +1546,24 @@ class XMPPAdapter(BasePlatformAdapter):
             # a large source image cannot stall the gateway loop during startup.
             data, width, height = await asyncio.to_thread(self._prepare_avatar_bytes, path)
 
+            # Re-check: the client may have been replaced/nulled during to_thread.
+            if self.client is not client:
+                logger.info("XMPP: client changed during avatar prep; aborting publish")
+                return
+
+            # Size guard: if the base64-encoded avatar exceeds 200 KiB the server
+            # will reject the vCard stanza and close the stream (Prosody default
+            # c2s_stanza_size_limit = 256 KiB) → reconnect loop. Skip and warn.
+            import base64 as _b64
+            b64_size = len(_b64.b64encode(data))
+            if b64_size > 200 * 1024:
+                logger.warning(
+                    "XMPP: avatar too large (%d KiB base64 > 200 KiB), "
+                    "skipping publish to avoid server policy-violation",
+                    b64_size // 1024,
+                )
+                return
+
             # Ask the server whether it already has this exact avatar. When it
             # does there is nothing to publish: republishing on every start is
             # what produced the duplicate "bot is online" toast (set_avatar's
@@ -1550,8 +1572,13 @@ class XMPPAdapter(BasePlatformAdapter):
                 logger.info("XMPP: avatar already on server; skipping publish")
                 return
 
+            # Re-check: client may have been replaced during the server query.
+            if self.client is not client:
+                logger.info("XMPP: client changed during server avatar check; aborting publish")
+                return
+
             # Always publish vCard avatar (XEP-0153); most clients use this.
-            vcard_avatar = self.client.plugin.get("xep_0153", None)
+            vcard_avatar = client.plugin.get("xep_0153", None)
             if vcard_avatar is not None:
                 try:
                     await asyncio.wait_for(
@@ -1564,12 +1591,23 @@ class XMPPAdapter(BasePlatformAdapter):
             else:
                 logger.warning("XMPP: xep_0153 plugin not available")
 
+            # Re-check client identity before PEP publish (avoid crash if None).
+            if self.client is not client:
+                logger.info("XMPP: client changed during vCard publish; aborting PEP")
+                return
+
             # Try PEP/XEP-0084 second (best effort, can hang on some servers).
-            pep_avatar = self.client.plugin.get("xep_0084", None)
+            pep_avatar = client.plugin.get("xep_0084", None)
             if pep_avatar is not None:
                 try:
                     avatar_id = pep_avatar.generate_id(data)
                     await asyncio.wait_for(pep_avatar.publish_avatar(data), timeout=5.0)
+
+                    # Re-check: client may have been replaced during the PEP publish.
+                    if self.client is not client:
+                        logger.info("XMPP: client changed during PEP avatar publish; aborting metadata")
+                        return
+
                     await asyncio.wait_for(pep_avatar.publish_avatar_metadata({
                         "id": avatar_id,
                         "type": "image/png",
@@ -1601,11 +1639,14 @@ class XMPPAdapter(BasePlatformAdapter):
         left = (width - side) // 2
         top = (height - side) // 2
         img = img.crop((left, top, left + side, top + side))
+        # 256x256 is sufficient for an XMPP avatar and keeps the base64 payload
+        # (~30-120 KiB) well under Prosody's default c2s_stanza_size_limit
+        # (256 KiB), avoiding server-side policy-violation stream closure.
         try:
-            img = img.resize((480, 480), Image.Resampling.LANCZOS)
+            img = img.resize((256, 256), Image.Resampling.LANCZOS)
         except AttributeError:
             # Pillow < 9.1 uses the Image.LANCZOS constant.
-            img = img.resize((480, 480), Image.LANCZOS)
+            img = img.resize((256, 256), Image.LANCZOS)
 
         png_buffer = io.BytesIO()
         img.save(png_buffer, format="PNG", optimize=True)
