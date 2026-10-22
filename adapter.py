@@ -1992,6 +1992,22 @@ class XMPPAdapter(BasePlatformAdapter):
                 thread_id=None,
             )
 
+            # Hermes core (gateway/session_envelope.py::_native_metadata) only
+            # admits WhatsApp-shaped metadata through native admission; any other
+            # non-empty metadata dict is refused with invalid_params, which drops
+            # the message before the agent ever sees it. The XMPP-specific keys
+            # below are not consumed by the core — debug-log them and send an
+            # empty dict so the event passes admission on every platform.
+            if encrypted or media_path or url:
+                logger.debug(
+                    "XMPP: message metadata (logged, not passed to gateway): "
+                    "encrypted=%s media_url=%s media_path=%s",
+                    encrypted,
+                    # The raw media URL can carry the aesgcm:// decryption key in
+                    # its fragment; keep the key out of logs too.
+                    _log_safe_url(url) if url else None,
+                    media_path,
+                )
             event = MessageEvent(
                 text=display_text,
                 message_type=msg_type,
@@ -1999,14 +2015,7 @@ class XMPPAdapter(BasePlatformAdapter):
                 raw_message=msg,
                 media_urls=media_urls,
                 media_types=media_types,
-                metadata={
-                    "encrypted": encrypted,
-                    # The raw media URL can carry the aesgcm:// decryption key in
-                    # its fragment; keep the key out of the agent context and the
-                    # session store by recording a redacted form here.
-                    "media_url": _log_safe_url(url) if url else url,
-                    "media_path": media_path,
-                },
+                metadata={},
             )
 
             logger.debug("XMPP: about to handle_message event text=%r type=%s", display_text, msg_type)
